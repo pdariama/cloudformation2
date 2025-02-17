@@ -1,0 +1,138 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Template to test non-existent metric checking'
+
+Parameters:
+  InstanceId:
+    Type: String
+    Description: 'ID of the EC2 instance to monitor'
+    Default: 'i-0b38ea60d65bee2c2'
+  AlarmName:
+    Type: String
+    Description: 'Name for the fake metric alarm'
+    Default: 'NonExistent-Metric-Alarm'
+  Threshold:
+    Type: Number
+    Description: 'Threshold for the alarm'
+    Default: 80
+  SNSTopicArn:
+    Type: String
+    Description: 'SNS Topic ARN for alarm notifications'
+
+Resources:
+  MetricCheckFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt MetricCheckRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+          import time
+          from urllib.request import Request, urlopen
+          import json
+          
+          def send_response(event, context, response_status, response_data):
+              response_body = {
+                  'Status': response_status,
+                  'Reason': 'See the details in CloudWatch Log Stream: ' + context.log_stream_name,
+                  'PhysicalResourceId': context.log_stream_name,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': response_data
+              }
+              
+              response_body = json.dumps(response_body)
+              headers = {
+                  'content-type': '',
+                  'content-length': str(len(response_body))
+              }
+              
+              req = Request(
+                  event['ResponseURL'],
+                  data=response_body.encode('utf-8'),
+                  headers=headers,
+                  method='PUT'
+              )
+              
+              try:
+                  urlopen(req)
+                  print("Response sent successfully")
+              except Exception as e:
+                  print("Failed to send response: {}".format(e))
+          
+          def handler(event, context):
+              print("Received event: {}".format(json.dumps(event)))
+              response_data = {'MetricExists': False, 'AlarmCreated': False}
+              
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      cloudwatch = boto3.client('cloudwatch')
+                      instance_id = event['ResourceProperties']['InstanceId']
+                      
+                      # Check for non-existent metric
+                      response = cloudwatch.list_metrics(
+                          Namespace='Custom/NonExistent',
+                          MetricName='FakeMetric',
+                          Dimensions=[
+                              {
+                                  'Name': 'InstanceId',
+                                  'Value': instance_id
+                              }
+                          ]
+                      )
+                      
+                      metrics_exist = len(response['Metrics']) > 0
+                      response_data['MetricExists'] = metrics_exist
+                      print(f"Metric exists: {metrics_exist}")
+                      
+                      # This won't execute since metric doesn't exist
+                      if metrics_exist:
+                          response_data['AlarmCreated'] = True
+                  
+                  send_response(event, context, 'SUCCESS', response_data)
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  send_response(event, context, 'FAILED', {'Error': str(e)})
+
+  MetricCheckRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudWatchAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:ListMetrics
+                  - cloudwatch:PutMetricAlarm
+                Resource: '*'
+
+  MetricCheck:
+    Type: Custom::MetricCheck
+    Properties:
+      ServiceToken: !GetAtt MetricCheckFunction.Arn
+      InstanceId: !Ref InstanceId
+      AlarmName: !Ref AlarmName
+      Threshold: !Ref Threshold
+      SNSTopicArn: !Ref SNSTopicArn
+
+Outputs:
+  MetricExists:
+    Description: 'Whether the fake metric exists'
+    Value: !GetAtt MetricCheck.MetricExists
+  AlarmCreated:
+    Description: 'Whether the alarm was created'
+    Value: !GetAtt MetricCheck.AlarmCreated
