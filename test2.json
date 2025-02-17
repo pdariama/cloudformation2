@@ -24,23 +24,55 @@ Resources:
       Runtime: python3.9
       Handler: index.handler
       Role: !GetAtt MetricCheckRole.Arn
+      Timeout: 30
       Code:
         ZipFile: |
           import boto3
-          import cfnresponence
           import time
+          from urllib.request import Request, urlopen
+          import json
+          
+          def send_response(event, context, response_status, response_data):
+              response_body = {
+                  'Status': response_status,
+                  'Reason': 'See the details in CloudWatch Log Stream: ' + context.log_stream_name,
+                  'PhysicalResourceId': context.log_stream_name,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': response_data
+              }
+              
+              response_body = json.dumps(response_body)
+              headers = {
+                  'content-type': '',
+                  'content-length': str(len(response_body))
+              }
+              
+              req = Request(
+                  event['ResponseURL'],
+                  data=response_body.encode('utf-8'),
+                  headers=headers,
+                  method='PUT'
+              )
+              
+              try:
+                  urlopen(req)
+                  print("Response sent successfully")
+              except Exception as e:
+                  print("Failed to send response: {}".format(e))
           
           def handler(event, context):
-              # Initialize response data
-              response_data = {'MetricExists': False}
+              print("Received event: {}".format(json.dumps(event)))
+              response_data = {'MetricExists': False, 'AlarmCreated': False}
               
-              if event['RequestType'] in ['Create', 'Update']:
-                  cloudwatch = boto3.client('cloudwatch')
-                  instance_id = event['ResourceProperties']['InstanceId']
-                  
-                  # Try up to 3 times with a delay
-                  for attempt in range(3):
-                      try:
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      cloudwatch = boto3.client('cloudwatch')
+                      instance_id = event['ResourceProperties']['InstanceId']
+                      
+                      # Try up to 3 times with a delay
+                      for attempt in range(3):
                           response = cloudwatch.list_metrics(
                               Namespace='AWS/EC2',
                               MetricName='CPUUtilization',
@@ -56,48 +88,41 @@ Resources:
                           if metrics_exist:
                               response_data['MetricExists'] = True
                               break
-                          elif attempt < 2:  # Wait before retry if metrics don't exist
+                          elif attempt < 2:
                               time.sleep(10)
-                      except Exception as e:
-                          if attempt == 2:  # Last attempt
-                              return cfnresponse.send(event, context, cfnresponse.FAILED, 
-                                  {'Error': str(e)})
-                          time.sleep(10)
-              
-              # Create alarm only if metric exists
-              if response_data['MetricExists']:
-                  try:
-                      cloudwatch = boto3.client('cloudwatch')
-                      alarm_name = event['ResourceProperties']['AlarmName']
-                      threshold = float(event['ResourceProperties']['Threshold'])
-                      sns_topic = event['ResourceProperties']['SNSTopicArn']
                       
-                      cloudwatch.put_metric_alarm(
-                          AlarmName=alarm_name,
-                          MetricName='CPUUtilization',
-                          Namespace='AWS/EC2',
-                          Statistic='Average',
-                          Period=300,
-                          EvaluationPeriods=2,
-                          DatapointsToAlarm=2,
-                          Threshold=threshold,
-                          ComparisonOperator='GreaterThanThreshold',
-                          TreatMissingData='notBreaching',
-                          Dimensions=[
-                              {
-                                  'Name': 'InstanceId',
-                                  'Value': instance_id
-                              }
-                          ],
-                          AlarmDescription=f'Alarm when CPU exceeds {threshold}% for 10 minutes',
-                          AlarmActions=[sns_topic]
-                      )
-                      response_data['AlarmCreated'] = True
-                  except Exception as e:
-                      return cfnresponse.send(event, context, cfnresponse.FAILED, 
-                          {'Error': str(e)})
-              
-              return cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                      # Create alarm only if metric exists
+                      if response_data['MetricExists']:
+                          alarm_name = event['ResourceProperties']['AlarmName']
+                          threshold = float(event['ResourceProperties']['Threshold'])
+                          sns_topic = event['ResourceProperties']['SNSTopicArn']
+                          
+                          cloudwatch.put_metric_alarm(
+                              AlarmName=alarm_name,
+                              MetricName='CPUUtilization',
+                              Namespace='AWS/EC2',
+                              Statistic='Average',
+                              Period=300,
+                              EvaluationPeriods=2,
+                              DatapointsToAlarm=2,
+                              Threshold=threshold,
+                              ComparisonOperator='GreaterThanThreshold',
+                              TreatMissingData='notBreaching',
+                              Dimensions=[
+                                  {
+                                      'Name': 'InstanceId',
+                                      'Value': instance_id
+                                  }
+                              ],
+                              AlarmDescription=f'Alarm when CPU exceeds {threshold}% for 10 minutes',
+                              AlarmActions=[sns_topic]
+                          )
+                          response_data['AlarmCreated'] = True
+                  
+                  send_response(event, context, 'SUCCESS', response_data)
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  send_response(event, context, 'FAILED', {'Error': str(e)})
 
   MetricCheckRole:
     Type: AWS::IAM::Role
