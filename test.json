@@ -1,0 +1,118 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Template to create CloudWatch Alarm for CPU Utilization'
+
+Parameters:
+  InstanceId:
+    Type: String
+    Description: 'ID of the EC2 instance to monitor'
+  AlarmName:
+    Type: String
+    Description: 'Name for the CPU Utilization alarm'
+    Default: 'High-CPU-Utilization-Alarm'
+  CPUThreshold:
+    Type: Number
+    Description: 'CPU Utilization threshold percentage'
+    Default: 80
+  SNSTopicArn:
+    Type: String
+    Description: 'SNS Topic ARN for alarm notifications'
+
+Resources:
+  MetricExistenceCheck:
+    Type: Custom::MetricCheck
+    Properties:
+      ServiceToken: !GetAtt MetricCheckFunction.Arn
+      InstanceId: !Ref InstanceId
+
+  MetricCheckFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt MetricCheckRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          
+          def handler(event, context):
+              if event['RequestType'] in ['Create', 'Update']:
+                  try:
+                      cloudwatch = boto3.client('cloudwatch')
+                      response = cloudwatch.list_metrics(
+                          Namespace='AWS/EC2',
+                          MetricName='CPUUtilization',
+                          Dimensions=[
+                              {
+                                  'Name': 'InstanceId',
+                                  'Value': event['ResourceProperties']['InstanceId']
+                              }
+                          ]
+                      )
+                      
+                      metrics_exist = len(response['Metrics']) > 0
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, 
+                          {'MetricExists': metrics_exist})
+                  except Exception as e:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, 
+                          {'Error': str(e)})
+              else:
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
+  MetricCheckRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudWatchMetricAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:ListMetrics
+                Resource: '*'
+
+  CPUUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: MetricExists
+    Properties:
+      AlarmName: !Ref AlarmName
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: !Ref CPUThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref InstanceId
+      AlarmDescription: !Sub 'Alarm when CPU exceeds ${CPUThreshold}% for 10 minutes'
+      AlarmActions:
+        - !Ref SNSTopicArn
+
+Conditions:
+  MetricExists: !Equals 
+    - !GetAtt MetricExistenceCheck.MetricExists
+    - true
+
+Outputs:
+  MetricExists:
+    Description: 'Whether the CPU Utilization metric exists for the instance'
+    Value: !GetAtt MetricExistenceCheck.MetricExists
+  AlarmArn:
+    Description: 'ARN of the created CloudWatch Alarm'
+    Value: !Ref CPUUtilizationAlarm
+    Condition: MetricExists
